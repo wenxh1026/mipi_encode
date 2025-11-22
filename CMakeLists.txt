@@ -22,8 +22,8 @@ project(mipi_mpp C)
     set(PROJECT_DESCRIPTION "瑞芯微MPP的JPEG测试")
 set(TARGET "mipi_text")
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/usr/mipi_main.c" )
-    set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/usr/mipi_main.c
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/mipi_main.c" )
+    set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/mipi_main.c
                      #${CMAKE_CURRENT_SOURCE_DIR}/lib/jpeg_function.c
                      #${CMAKE_CURRENT_SOURCE_DIR}/lib/jpeg_mpp.c
         )

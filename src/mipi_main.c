@@ -7,7 +7,6 @@
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 #include <rockchip/rk_mpi.h>
-
 // 摄像头设备结构体
 typedef struct {
     int fd;                         // 摄像头文件描述符
@@ -24,7 +23,7 @@ typedef struct {
     MppCtx ctx;                     // MPP上下文
     MppApi* mpi;                    // MPP接口
     MppEncPrepCfg prep_cfg;         // 预处理配置
-    MppEncCodecCfg codec_cfg;       // 编解码配置
+    MppEncCfg codec_cfg;       // 编解码配置
 } mpp_encoder_t;
 
 /**
@@ -46,41 +45,54 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     if (cam->fd < 0) {
         perror("无法打开摄像头设备");
         return -1;
-    } 
+    } else{
+        printf("打开成功！\n");
+    }
     
     // 2. 查询设备能力
     if (ioctl(cam->fd, VIDIOC_QUERYCAP, &cap) < 0) {
         perror("无法查询设备能力");
         close(cam->fd);
         return -1;
+    }else{
+        printf("查询设备能力成功！\n");
     }
     
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
         printf("错误: 设备不支持视频采集\n");
         close(cam->fd);
-        return -1;
+    }else{
+        printf("设备支持多平面采集！\n");
     }
     
     if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
         printf("错误: 设备不支持流式IO\n");
         close(cam->fd);
-        return -1;
+    }else{
+        printf("设备支持流式IO！\n");
     }
     
     printf("摄像头支持能力: 0x%x\n", cap.capabilities);
     
     // 3. 设置图像格式
     memset(&cam->fmt, 0, sizeof(cam->fmt));
-    cam->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    cam->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     cam->fmt.fmt.pix.width = width;
     cam->fmt.fmt.pix.height = height;
     cam->fmt.fmt.pix.pixelformat = pixelformat;
     cam->fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    cam->fmt.fmt.pix_mp.num_planes = 2;
+    cam->fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 1920 * 1080;     // Y平面大小
+    cam->fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 1920;         // Y平面步长
+    cam->fmt.fmt.pix_mp.plane_fmt[1].sizeimage = 1920 * 1080 / 2; // UV平面大小
+    cam->fmt.fmt.pix_mp.plane_fmt[1].bytesperline = 1920;         // UV平面步长
     
     if (ioctl(cam->fd, VIDIOC_S_FMT, &cam->fmt) < 0) {
         perror("无法设置视频格式");
         close(cam->fd);
         return -1;
+    }else{
+        printf("设置视频格式成功！\n");
     }
     
     // 检查实际设置的格式
@@ -97,19 +109,23 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     // 4. 请求缓冲区
     memset(&cam->req, 0, sizeof(cam->req));
     cam->req.count = 4;  // 请求4个缓冲区
-    cam->req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    cam->req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     cam->req.memory = V4L2_MEMORY_MMAP;  // 内存映射方式
     
     if (ioctl(cam->fd, VIDIOC_REQBUFS, &cam->req) < 0) {
         perror("无法请求缓冲区");
         close(cam->fd);
         return -1;
+    }else{
+        printf("请求缓冲区成功！\n");
     }
     
     if (cam->req.count < 2) {
         printf("错误: 缓冲区数量不足: %d\n", cam->req.count);
         close(cam->fd);
         return -1;
+    }else{
+        printf("请求四个缓冲区成功！\n");
     }
     
     cam->n_buffers = cam->req.count;
@@ -118,30 +134,39 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
         printf("错误: 无法分配缓冲区指针数组\n");
         close(cam->fd);
         return -1;
+    }else{
+        printf("分配缓冲区指针数组成功...\n");
     }
     
     // 5. 映射缓冲区到用户空间
+    struct v4l2_plane planes[2];  // NV12有2个平面
     for (unsigned int i = 0; i < cam->n_buffers; i++) {
         memset(&cam->buf, 0, sizeof(cam->buf));
-        cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         cam->buf.memory = V4L2_MEMORY_MMAP;
         cam->buf.index = i;
-        
+        cam->buf.length = 2;        // 平面数量（NV12有2个平面）
+        cam->buf.m.planes = planes; // 指向平面数组
         if (ioctl(cam->fd, VIDIOC_QUERYBUF, &cam->buf) < 0) {
             perror("无法查询缓冲区信息");
             close(cam->fd);
             return -1;
+        }else{
+            printf("查询缓冲区信息成功...\n");
+            printf("  平面0: 偏移=%u, 长度=%u\n", 
+                   cam->buf.m.planes[0].m.mem_offset, 
+                   cam->buf.m.planes[0].length);
+            printf("  平面1: 偏移=%u, 长度=%u\n", 
+                   cam->buf.m.planes[1].m.mem_offset, 
+                   cam->buf.m.planes[1].length);
         }
-        
-        cam->buffers[i] = mmap(NULL, cam->buf.length, 
-                              PROT_READ | PROT_WRITE, 
-                              MAP_SHARED, 
-                              cam->fd, cam->buf.m.offset);
-        
+
         if (cam->buffers[i] == MAP_FAILED) {
             perror("无法映射缓冲区");
             close(cam->fd);
             return -1;
+        }else{
+            printf("映射缓冲区成功...\n");
         }
         
         cam->buf_size = cam->buf.length;
@@ -160,7 +185,7 @@ int camera_start_capture(camera_t* cam) {
     // 将所有缓冲区加入队列
     for (unsigned int i = 0; i < cam->n_buffers; i++) {
         memset(&cam->buf, 0, sizeof(cam->buf));
-        cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         cam->buf.memory = V4L2_MEMORY_MMAP;
         cam->buf.index = i;
         
@@ -171,7 +196,7 @@ int camera_start_capture(camera_t* cam) {
     }
     
     // 开始采集
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     if (ioctl(cam->fd, VIDIOC_STREAMON, &type) < 0) {
         perror("无法开始采集流");
         return -1;
@@ -211,7 +236,7 @@ void* capture_yuv_frame(camera_t* cam, int timeout_ms) {
     
     // 从队列中取出缓冲区
     memset(&cam->buf, 0, sizeof(cam->buf));
-    cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     cam->buf.memory = V4L2_MEMORY_MMAP;
     
     if (ioctl(cam->fd, VIDIOC_DQBUF, &cam->buf) < 0) {
@@ -327,9 +352,54 @@ int encode_frame_to_jpeg(mpp_encoder_t* encoder, MppFrame frame, const char* out
     MPP_RET ret = MPP_OK;
     MppPacket packet = NULL;
     FILE* fp = NULL;
-
+    MppBufferGroup group;
+    MppBuffer buffer2;
+    mpp_buffer_group_get_internal(&group,MPP_BUFFER_TYPE_ION);
+    mpp_buffer_group_limit_config(group,1920*1080*3/2+1920*4,1);
+    mpp_buffer_get(group,&buffer2,1920*1080*3/2+1920*4);
+    if (ret!=MPP_OK){
+        printf("   MPP内存池限制失败，请重试！\n");
+        return -1;
+    }else{
+        printf("   MPP内存池限制成功！\n");
+    }
     printf("开始JPEG编码...\n");
-    
+    mpp_enc_cfg_init(&encoder->codec_cfg);
+    ret = mpp_enc_cfg_init(&encoder->codec_cfg);
+    if (ret != MPP_OK) {
+        printf("   ❌ 编码配置初始化失败: %d\n", ret);
+        mpp_destroy(encoder->ctx);
+        return -1;
+    }
+    ret = encoder->mpi->control(encoder->ctx, MPP_ENC_GET_CFG, encoder->codec_cfg);
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "prep:width", 1920);
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "prep:height", 1080);
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "prep:hor_stride",1920);
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "prep:ver_stride",1080);
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "prep:format", MPP_FMT_YUV420SP);  // NV12格式
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "jpeg:q_factor", 80);    // JPEG质量
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "jpeg:qf_max", 99);    
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "jpeg:qf_min", 1);      
+    mpp_enc_cfg_set_s32(encoder->codec_cfg, "rc:mode", MPP_ENC_RC_MODE_FIXQP); 
+    ret = encoder->mpi->control(encoder->ctx, MPP_ENC_SET_CFG, encoder->codec_cfg);
+    if (ret) {
+        printf("   ❌ 编码器配置失败: %d\n", ret);
+        mpp_enc_cfg_deinit(encoder->codec_cfg);
+        mpp_destroy(encoder->ctx);
+        return -1;
+    }
+    printf("   ✅ 编码器配置成功!\n");
+
+    //得到元数据
+    MppMeta meta = mpp_frame_get_meta(frame);
+    //初始化包至缓冲区
+    ret=mpp_packet_init_with_buffer(&packet, buffer2);
+    //将帧元数据与包关联
+    mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, packet);
+    //初始化包的长度
+    mpp_packet_set_length(packet, 0);
+
+
     // 1. 将帧送入编码器
     ret = encoder->mpi->encode_put_frame(encoder->ctx, frame);
     if (ret != MPP_OK) {
@@ -342,17 +412,24 @@ int encode_frame_to_jpeg(mpp_encoder_t* encoder, MppFrame frame, const char* out
     if (ret != MPP_OK) {
         printf("错误: 无法获取编码数据包, ret=%d\n", ret);
         return -1;
+    }else{
+            printf("   获取帧成功！\n\n");
+            
     }
     
     if (packet == NULL) {
         printf("错误: 编码数据包为空\n");
         return -1;
+    }else{
+            printf("   获取包成功！\n\n");
+            
     }
     
     // 3. 获取JPEG数据
     void* jpeg_data = mpp_packet_get_data(packet);
+    printf("   packet指针的位置在：%p\n",jpeg_data);
     size_t jpeg_size = mpp_packet_get_length(packet);
-    
+    printf("   此次JPEG图像大小为：%ld\n",jpeg_size);
     if (jpeg_data == NULL || jpeg_size == 0) {
         printf("错误: JPEG数据无效\n");
         mpp_packet_deinit(&packet);
@@ -380,7 +457,7 @@ int encode_frame_to_jpeg(mpp_encoder_t* encoder, MppFrame frame, const char* out
     
     // 5. 清理数据包
     mpp_packet_deinit(&packet);
-    
+    mpp_buffer_put(buffer2);
     return 0;
 }
 
@@ -393,11 +470,11 @@ int main() {
     void* yuv_data;
     MppFrame frame;
     
-    const char* camera_device = "/dev/video0";
+    const char* camera_device = "/dev/video11";
     const char* output_file = "capture.jpg";
     int width = 1920;
     int height = 1080;
-    uint32_t pixelformat = V4L2_PIX_FMT_YUYV;  // YUV422格式
+    uint32_t pixelformat = V4L2_PIX_FMT_NV12;  // YUV422格式
     
     printf("=== RK3562摄像头YUV数据采集与MPP Buffer处理示例 ===\n");
     
@@ -448,9 +525,9 @@ int main() {
     }
     
     // 5. 编码为JPEG（这里假设encoder已经初始化）
-    // if (encode_frame_to_jpeg(&encoder, frame, output_file) != 0) {
-    //     printf("JPEG编码失败!\n");
-    // }
+    if (encode_frame_to_jpeg(&encoder, frame, output_file) != 0) {
+        printf("JPEG编码失败!\n");
+    }
     
     // 6. 清理资源
     mpp_frame_deinit(&frame);
