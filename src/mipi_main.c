@@ -13,7 +13,7 @@ typedef struct {
     struct v4l2_format fmt;         // 视频格式
     struct v4l2_buffer buf;         // 缓冲区信息
     struct v4l2_requestbuffers req; // 缓冲区请求
-    void** buffers;                 // 映射的缓冲区指针数组
+    void** buffers[4][2];                 // 映射的缓冲区指针数组
     unsigned int n_buffers;        // 缓冲区数量
     unsigned int buf_size;          // 每个缓冲区大小
 } camera_t;
@@ -77,16 +77,16 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     // 3. 设置图像格式
     memset(&cam->fmt, 0, sizeof(cam->fmt));
     cam->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    cam->fmt.fmt.pix.width = width;
-    cam->fmt.fmt.pix.height = height;
-    cam->fmt.fmt.pix.pixelformat = pixelformat;
-    cam->fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    cam->fmt.fmt.pix_mp.width = width;                    // 使用 pix_mp
+    cam->fmt.fmt.pix_mp.height = height;                  // 使用 pix_mp
+    cam->fmt.fmt.pix_mp.pixelformat = pixelformat;        // 使用 pix_mp
+    cam->fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
     cam->fmt.fmt.pix_mp.num_planes = 2;
-    cam->fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 1920 * 1080;     // Y平面大小
-    cam->fmt.fmt.pix_mp.plane_fmt[0].bytesperline = 1920;         // Y平面步长
-    cam->fmt.fmt.pix_mp.plane_fmt[1].sizeimage = 1920 * 1080 / 2; // UV平面大小
-    cam->fmt.fmt.pix_mp.plane_fmt[1].bytesperline = 1920;         // UV平面步长
-    
+    cam->fmt.fmt.pix_mp.plane_fmt[0].sizeimage = width * height;     // Y平面大小
+    cam->fmt.fmt.pix_mp.plane_fmt[0].bytesperline = width;          // Y平面步长
+    cam->fmt.fmt.pix_mp.plane_fmt[1].sizeimage = width * height / 2; // UV平面大小
+    cam->fmt.fmt.pix_mp.plane_fmt[1].bytesperline = width;          // UV平面步长
+        
     if (ioctl(cam->fd, VIDIOC_S_FMT, &cam->fmt) < 0) {
         perror("无法设置视频格式");
         close(cam->fd);
@@ -95,17 +95,7 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
         printf("设置视频格式成功！\n");
     }
     
-    // 检查实际设置的格式
-    if (ioctl(cam->fd, VIDIOC_G_FMT, &cam->fmt) < 0) {
-        perror("无法获取视频格式");
-        close(cam->fd);
-        return -1;
-    }
-    
-    printf("实际设置格式: %dx%d, pixelformat: 0x%08x\n", 
-           cam->fmt.fmt.pix.width, cam->fmt.fmt.pix.height, 
-           cam->fmt.fmt.pix.pixelformat);
-    
+
     // 4. 请求缓冲区
     memset(&cam->req, 0, sizeof(cam->req));
     cam->req.count = 4;  // 请求4个缓冲区
@@ -129,15 +119,6 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     }
     
     cam->n_buffers = cam->req.count;
-    cam->buffers = calloc(cam->n_buffers, sizeof(void*));
-    if (!cam->buffers) {
-        printf("错误: 无法分配缓冲区指针数组\n");
-        close(cam->fd);
-        return -1;
-    }else{
-        printf("分配缓冲区指针数组成功...\n");
-    }
-    
     // 5. 映射缓冲区到用户空间
     struct v4l2_plane planes[2];  // NV12有2个平面
     for (unsigned int i = 0; i < cam->n_buffers; i++) {
@@ -160,15 +141,25 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
                    cam->buf.m.planes[1].m.mem_offset, 
                    cam->buf.m.planes[1].length);
         }
+        for (int j = 0; j < 2; j++) { // NV12有两个平面
+            cam->buffers[i][j] = mmap(
+                NULL, // 让系统自动选择映射起始地址
+                cam->buf.m.planes[j].length, // 该平面的长度
+                PROT_READ | PROT_WRITE, // 映射区域可读可写
+                MAP_SHARED, // 对映射区域的修改会同步到设备
+                cam->fd, // 摄像头设备的文件描述符
+                cam->buf.m.planes[j].m.mem_offset // 该平面在缓冲区中的偏移量
+            );
 
-        if (cam->buffers[i] == MAP_FAILED) {
-            perror("无法映射缓冲区");
-            close(cam->fd);
-            return -1;
-        }else{
-            printf("映射缓冲区成功...\n");
+            // 正确的错误检查：判断返回值是否为 MAP_FAILED
+            if (cam->buffers[i][j] == MAP_FAILED) {
+                perror("无法映射缓冲区");
+                close(cam->fd);
+                return -1;
+            } else {
+                printf("缓冲区 %d 平面 %d 映射成功，地址：%p\n", i, j, cam->buffers[i][j]);
+            }
         }
-        
         cam->buf_size = cam->buf.length;
         printf("缓冲区 %d: 地址=%p, 大小=%u\n", i, cam->buffers[i], cam->buf_size);
     }
@@ -267,7 +258,7 @@ int requeue_buffer(camera_t* cam) {
 }
 
 /**
- * @brief 将YUV数据放入MPP Buffer（Internal模式关键函数）
+ * @brief 将YUV数据放入MPP Buffer
  * @param encoder MPP编码器指针
  * @param yuv_data YUV数据指针
  * @param yuv_size YUV数据大小
