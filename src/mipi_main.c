@@ -13,7 +13,7 @@ typedef struct {
     struct v4l2_format fmt;         // 视频格式
     struct v4l2_buffer buf;         // 缓冲区信息
     struct v4l2_requestbuffers req; // 缓冲区请求
-    void** buffers[4][2];                 // 映射的缓冲区指针数组
+    void* buffers[4][2];                 // 映射的缓冲区指针数组
     unsigned int n_buffers;        // 缓冲区数量
     unsigned int buf_size;          // 每个缓冲区大小
 } camera_t;
@@ -61,6 +61,7 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
         printf("错误: 设备不支持视频采集\n");
         close(cam->fd);
+        return -1;
     }else{
         printf("设备支持多平面采集！\n");
     }
@@ -68,6 +69,7 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
         printf("错误: 设备不支持流式IO\n");
         close(cam->fd);
+        return -1;
     }else{
         printf("设备支持流式IO！\n");
     }
@@ -81,11 +83,10 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     cam->fmt.fmt.pix_mp.height = height;                  // 使用 pix_mp
     cam->fmt.fmt.pix_mp.pixelformat = pixelformat;        // 使用 pix_mp
     cam->fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
-    cam->fmt.fmt.pix_mp.num_planes = 2;
-    cam->fmt.fmt.pix_mp.plane_fmt[0].sizeimage = width * height;     // Y平面大小
+    cam->fmt.fmt.pix_mp.num_planes = 1;
+    cam->fmt.fmt.pix_mp.plane_fmt[0].sizeimage = width * height*3/2;     // Y平面大小
     cam->fmt.fmt.pix_mp.plane_fmt[0].bytesperline = width;          // Y平面步长
-    cam->fmt.fmt.pix_mp.plane_fmt[1].sizeimage = width * height / 2; // UV平面大小
-    cam->fmt.fmt.pix_mp.plane_fmt[1].bytesperline = width;          // UV平面步长
+
         
     if (ioctl(cam->fd, VIDIOC_S_FMT, &cam->fmt) < 0) {
         perror("无法设置视频格式");
@@ -93,6 +94,35 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
         return -1;
     }else{
         printf("设置视频格式成功！\n");
+    }
+
+    // 设置格式后，立即获取驱动实际设置的格式进行验证
+    struct v4l2_format actual_fmt;
+    memset(&actual_fmt, 0, sizeof(actual_fmt));
+    actual_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    if (ioctl(cam->fd, VIDIOC_G_FMT, &actual_fmt) == 0) {
+        printf("驱动实际设置的格式信息：\n");
+        printf("  像素格式: 0x%x (预期: 0x%x)\n", actual_fmt.fmt.pix_mp.pixelformat, pixelformat);
+        printf("  分辨率: %dx%d (预期: %dx%d)\n", actual_fmt.fmt.pix_mp.width, actual_fmt.fmt.pix_mp.height, width, height);
+        printf("  平面数量: %d\n", actual_fmt.fmt.pix_mp.num_planes);
+        
+        for (int i = 0; i < actual_fmt.fmt.pix_mp.num_planes; i++) {
+            printf("  平面[%d] - 步长: %u, 图像大小: %u\n", 
+                i, 
+                actual_fmt.fmt.pix_mp.plane_fmt[i].bytesperline,
+                actual_fmt.fmt.pix_mp.plane_fmt[i].sizeimage);
+        }
+
+        // 检查关键参数是否被驱动修改
+        if (actual_fmt.fmt.pix_mp.pixelformat != pixelformat) {
+            printf("警告：驱动修改了像素格式！\n");
+        }
+        if (actual_fmt.fmt.pix_mp.num_planes <= 1) {
+            printf("严重警告：驱动返回的平面数量为 %d，可能不支持多平面NV12！\n", actual_fmt.fmt.pix_mp.num_planes);
+        }
+    } else {
+        perror("无法获取实际视频格式");
     }
     
 
@@ -120,13 +150,15 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
     
     cam->n_buffers = cam->req.count;
     // 5. 映射缓冲区到用户空间
-    struct v4l2_plane planes[2];  // NV12有2个平面
+
     for (unsigned int i = 0; i < cam->n_buffers; i++) {
+        struct v4l2_plane planes[1];  // 只分配一个平面
+        memset(planes, 0, sizeof(planes)); // 关键：清空数组
         memset(&cam->buf, 0, sizeof(cam->buf));
         cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         cam->buf.memory = V4L2_MEMORY_MMAP;
         cam->buf.index = i;
-        cam->buf.length = 2;        // 平面数量（NV12有2个平面）
+        cam->buf.length = 1;        // 平面数量（只分配一个平面）
         cam->buf.m.planes = planes; // 指向平面数组
         if (ioctl(cam->fd, VIDIOC_QUERYBUF, &cam->buf) < 0) {
             perror("无法查询缓冲区信息");
@@ -137,34 +169,30 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
             printf("  平面0: 偏移=%u, 长度=%u\n", 
                    cam->buf.m.planes[0].m.mem_offset, 
                    cam->buf.m.planes[0].length);
-            printf("  平面1: 偏移=%u, 长度=%u\n", 
-                   cam->buf.m.planes[1].m.mem_offset, 
-                   cam->buf.m.planes[1].length);
         }
-        for (int j = 0; j < 2; j++) { // NV12有两个平面
-            cam->buffers[i][j] = mmap(
+            cam->buffers[i][0] = mmap(
                 NULL, // 让系统自动选择映射起始地址
-                cam->buf.m.planes[j].length, // 该平面的长度
+                cam->buf.m.planes[0].length, // 该平面的长度
                 PROT_READ | PROT_WRITE, // 映射区域可读可写
                 MAP_SHARED, // 对映射区域的修改会同步到设备
                 cam->fd, // 摄像头设备的文件描述符
-                cam->buf.m.planes[j].m.mem_offset // 该平面在缓冲区中的偏移量
+                cam->buf.m.planes[0].m.mem_offset // 该平面在缓冲区中的偏移量
             );
 
             // 正确的错误检查：判断返回值是否为 MAP_FAILED
-            if (cam->buffers[i][j] == MAP_FAILED) {
+            if (cam->buffers[i][0] == MAP_FAILED) {
                 perror("无法映射缓冲区");
                 close(cam->fd);
                 return -1;
             } else {
-                printf("缓冲区 %d 平面 %d 映射成功，地址：%p\n", i, j, cam->buffers[i][j]);
+                printf("缓冲区 %d  映射成功，地址：%p\n", i,  cam->buffers[i][0]);
             }
-        }
-        cam->buf_size = cam->buf.length;
+
+        cam->buf_size = cam->buf.m.planes[0].length+cam->buf.m.planes[1].length;
         printf("缓冲区 %d: 地址=%p, 大小=%u\n", i, cam->buffers[i], cam->buf_size);
     }
     
-    printf("摄像头初始化成功\n");
+    printf("====摄像头初始化成功====\n\n\n");
     return 0;
 }
 /**
@@ -175,11 +203,14 @@ int camera_init(camera_t* cam, const char* device, int width, int height, uint32
 int camera_start_capture(camera_t* cam) {
     // 将所有缓冲区加入队列
     for (unsigned int i = 0; i < cam->n_buffers; i++) {
+        struct v4l2_plane planes[1]; // 只赋予一个平面
         memset(&cam->buf, 0, sizeof(cam->buf));
+        memset(planes, 0, sizeof(planes)); // 清空平面数组
         cam->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         cam->buf.memory = V4L2_MEMORY_MMAP;
         cam->buf.index = i;
-        
+        cam->buf.length = 1; // 明确指定平面数量
+        cam->buf.m.planes = planes; // 关联平面信息数组
         if (ioctl(cam->fd, VIDIOC_QBUF, &cam->buf) < 0) {
             perror("无法将缓冲区加入队列");
             return -1;
